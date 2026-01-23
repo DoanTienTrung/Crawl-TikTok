@@ -1,0 +1,23 @@
+{
+    "scheduler": {
+        "enabled": true,
+        "type": "interval",
+        "settings": {
+            "interval": {
+                "hours": 1,
+                "minutes": 0,
+                "seconds": 0
+            },
+            "cron": {
+                "hour": "8,14,20",
+                "minute": "0",
+                "day_of_week": "mon-sun"
+            },
+            "date": {
+                "run_date": "2025-01-24 08:00:00"
+            }
+        },
+        "run_on_startup": true,
+        "timezone": "Asia/Ho_Chi_Minh"
+    }
+}
