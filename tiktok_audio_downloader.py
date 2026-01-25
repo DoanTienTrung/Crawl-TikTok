@@ -29,7 +29,7 @@ def resolve_tiktok_target(username: str) -> str:
     return f"https://www.tiktok.com/@{username}"
 
 
-def get_latest_video_url(username: str):
+def get_latest_video_url(username: str, max_retries: int = 3):
     target = resolve_tiktok_target(username)
     print(f"🔍 Đang quét: {target}")
 
@@ -44,34 +44,44 @@ def get_latest_video_url(username: str):
         "extractor_args": {"tiktok": {"api_hostname": "api16-normal-c-useast1a.tiktokv.com", "skip": "web"}},
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(target, download=False)
-        entries = info.get("entries", [])
+    entries = []
+    for attempt in range(max_retries):
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(target, download=False)
+            entries = info.get("entries", [])
 
-        if not entries:
-            raise RuntimeError("Không lấy được danh sách video")
+            if entries:
+                break
 
-        # Bỏ video ghim + thiếu timestamp
-        valid = [
-            e for e in entries
-            if e.get("timestamp") and not e.get("is_pinned")
-        ]
+            if attempt < max_retries - 1:
+                wait = random.randint(30, 60)
+                print(f"⚠️ Không lấy được video, retry {attempt + 1}/{max_retries} sau {wait}s...")
+                time.sleep(wait)
 
-        if not valid:
-            raise RuntimeError("Không có video hợp lệ")
+    if not entries:
+        raise RuntimeError("Không lấy được danh sách video sau nhiều lần thử")
 
-        latest = max(valid, key=lambda e: e["timestamp"])
-        video_id = latest["id"]
-        title = latest.get("title", "")
+    # Bỏ video ghim + thiếu timestamp
+    valid = [
+        e for e in entries
+        if e.get("timestamp") and not e.get("is_pinned")
+    ]
 
-        return f"https://www.tiktok.com/@{username}/video/{video_id}", title
+    if not valid:
+        raise RuntimeError("Không có video hợp lệ")
+
+    latest = max(valid, key=lambda e: e["timestamp"])
+    video_id = latest["id"]
+    title = latest.get("title", "")
+
+    return f"https://www.tiktok.com/@{username}/video/{video_id}", title
 
 
 def download_audio(video_url: str, video_id: str):
     os.makedirs(AUDIO_DIR, exist_ok=True)
 
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": "bestaudio/best[acodec!=none]/best",
         "outtmpl": os.path.join(AUDIO_DIR, f"{video_id}.%(ext)s"),
         "cookies": COOKIES_FILE,
         "nocheckcertificate": True,
@@ -112,7 +122,7 @@ def main():
 
         print(f"\n🎵 Xử lý: {name}")
         print(f"⏳ Đợi random 40-50s để tránh rate limit...")
-        time.sleep(random.randint(40, 50))
+        time.sleep(random.randint(50, 60))
 
         try:
             video_url, title = get_latest_video_url(username)
@@ -120,7 +130,7 @@ def main():
             # Kiểm tra DB
             if not db.validate_yt_post(title, video_url):
                 print("⏭️ Đã tồn tại, bỏ qua")
-                time.sleep(random.randint(40, 50))
+                time.sleep(random.randint(50, 60))
                 continue
 
             video_id_db = f"t_{username}_{int(time.time())}"
@@ -131,7 +141,7 @@ def main():
             elapsed = time.time() - start
             print(f"✅ Thành công: {audio_path} ({elapsed:.1f}s)")
             print(f"⏳ Đợi random 40-50s trước khi tiếp tục...")
-            time.sleep(random.randint(40, 50))
+            time.sleep(random.randint(50, 60))
 
         except Exception as e:
             elapsed = time.time() - start
@@ -144,7 +154,7 @@ def main():
                 print(f"⚠️ Rate limit, đợi {wait//60} phút")
                 time.sleep(wait)
             else:
-                time.sleep(random.randint(40, 50))
+                time.sleep(random.randint(50, 60))
 
 
 def run_scheduler():
