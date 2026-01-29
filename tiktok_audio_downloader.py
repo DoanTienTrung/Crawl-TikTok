@@ -13,101 +13,246 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from db import db_adapter as db
 
+# Cấu hình logging: ghi file + in console
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler("tiktok_crawl.log", encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logging.getLogger("yt_dlp").setLevel(logging.WARNING)
+
 AUDIO_DIR = "downloads/audio"
-COOKIES_FILE = "cookies_loi.txt"
+COOKIES_DIR = "cookies"
+COOKIES_FILES = []  # Sẽ load sau
 CONFIG_FILE = "scheduler_config.json"
 
+# Load cookies files một lần khi script khởi động
+if os.path.exists(COOKIES_DIR):
+    COOKIES_FILES = [
+        os.path.join(COOKIES_DIR, f)
+        for f in os.listdir(COOKIES_DIR)
+        if f.endswith(".txt") and os.path.isfile(os.path.join(COOKIES_DIR, f))
+    ]
+    if COOKIES_FILES:
+        logging.info(f"Đã load {len(COOKIES_FILES)} file cookies từ '{COOKIES_DIR}'")
+    else:
+        logging.warning("Không tìm thấy file .txt nào trong thư mục cookies/")
+else:
+    logging.warning(f"Thư mục '{COOKIES_DIR}' không tồn tại → download không dùng cookies!")
 
 def load_config():
-    """Load scheduler config from JSON file"""
     config_path = os.path.join(os.path.dirname(__file__), CONFIG_FILE)
     with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+SECUID_CACHE_FILE = "secuid_cache.json"
 
+# ================= SECUID CACHE =================
+def load_secuid_cache():
+    if os.path.exists(SECUID_CACHE_FILE):
+        with open(SECUID_CACHE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_secuid_cache(cache: dict):
+    with open(SECUID_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+def get_cached_target(username: str):
+    cache = load_secuid_cache()
+    info = cache.get(username)
+
+    if not info:
+        return None
+
+    if info["status"] == "ok" and info.get("sec_uid"):
+        logging.info(f"🔁 Dùng secUid cache cho @{username}")
+        return f"tiktokuser:{info['sec_uid']}"
+
+    if info["status"] == "broken":
+        logging.info(f"🔁 @{username} bị đánh dấu broken → dùng WEB")
+        return f"https://www.tiktok.com/@{username}"
+
+    return None
+
+# ================= RESOLVE TARGET =================
 def resolve_tiktok_target(username: str) -> str:
-    return f"https://www.tiktok.com/@{username}"
+    # 1️⃣ Ưu tiên cache
+    cached = get_cached_target(username)
+    if cached:
+        return cached
 
+    profile_url = f"https://www.tiktok.com/@{username}"
+    logging.info(f"🔍 Thử lấy secUid cho @{username}")
 
-def get_latest_video_url(username: str, max_retries: int = 3):
+    configs = [
+        {"tiktok": {"api_hostname": "api16-normal-c-useast1a.tiktokv.com", "skip": "web"}},
+        {"tiktok": {"api_hostname": "api22-normal-c-useast1a.tiktokv.com", "skip": "web"}},
+        {"tiktok": {"api_hostname": "api.tiktokv.com"}},
+        {},
+    ]
+
+    for idx, extractor_args in enumerate(configs, 1):
+        ydl_opts = {
+            "quiet": True,
+            "extract_flat": True,
+            "skip_download": True,
+            "playlistend": 1,
+            "no_warnings": True,
+            "verbose": True,
+        }
+
+        if extractor_args:
+            ydl_opts["extractor_args"] = extractor_args
+
+        if COOKIES_FILES:
+            ydl_opts["cookies"] = random.choice(COOKIES_FILES)
+
+        try:
+            logging.info(f"  Thử config {idx}/{len(configs)}...")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(profile_url, download=False)
+                entries = info.get("entries", [])
+                if entries:
+                    e = entries[0]
+                    sec_uid = (
+                        e.get("uploader_id")
+                        or e.get("channel_id")
+                        or e.get("creator_id")
+                    )
+                    if sec_uid:
+                        logging.info(f"  ✓ Lấy được secUid: {sec_uid}")
+                        cache = load_secuid_cache()
+                        cache[username] = {
+                            "sec_uid": sec_uid,
+                            "status": "ok",
+                            "source": "auto",
+                            "updated_at": datetime.now().isoformat(),
+                        }
+                        save_secuid_cache(cache)
+                        return f"tiktokuser:{sec_uid}"
+        except Exception:
+            continue
+
+    # ❌ Không lấy được → đánh dấu broken
+    logging.warning(f"⚠️ @{username} không lấy được secUid → fallback WEB")
+    cache = load_secuid_cache()
+    if username not in cache:
+        cache[username] = {
+            "sec_uid": None,
+            "status": "broken",
+            "source": "auto",
+            "updated_at": datetime.now().isoformat(),
+        }
+        save_secuid_cache(cache)
+
+    return profile_url
+
+# ================= GET LATEST VIDEO =================
+def get_latest_video_url(username: str):
     target = resolve_tiktok_target(username)
-    print(f"🔍 Đang quét: {target}")
+    logging.info(f"🔍 Đang quét: {target}")
 
     ydl_opts = {
         "quiet": True,
         "extract_flat": True,
         "skip_download": True,
-        "playlistend": 5,
-        "no_warnings": True,
+        "playlistend": 10,
         "playlist_items": "1-10",
+        "no_warnings": True,
         "verbose": True,
-        "extractor_args": {"tiktok": {"api_hostname": "api16-normal-c-useast1a.tiktokv.com", "skip": "web"}},
     }
 
-    entries = []
-    for attempt in range(max_retries):
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(target, download=False)
-            entries = info.get("entries", [])
+    if target.startswith("tiktokuser:"):
+        ydl_opts["extractor_args"] = {"tiktok": {"skip": "web"}}
+        logging.info("  → Dùng TikTok API")
+    else:
+        ydl_opts["extractor_args"] = {"tiktok": {"skip": "api"}}
+        logging.info("  → Dùng WEB")
 
-            if entries:
-                break
+    if COOKIES_FILES:
+        ydl_opts["cookies"] = random.choice(COOKIES_FILES)
 
-            if attempt < max_retries - 1:
-                wait = random.randint(30, 60)
-                print(f"⚠️ Không lấy được video, retry {attempt + 1}/{max_retries} sau {wait}s...")
-                time.sleep(wait)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(target, download=False)
+        entries = info.get("entries", [])
 
     if not entries:
-        raise RuntimeError("Không lấy được danh sách video sau nhiều lần thử")
+        raise RuntimeError("Không lấy được danh sách video")
 
-    # Bỏ video ghim + thiếu timestamp
-    valid = [
-        e for e in entries
-        if e.get("timestamp") and not e.get("is_pinned")
-    ]
-
+    valid = [e for e in entries if e.get("timestamp") and not e.get("is_pinned")]
     if not valid:
         raise RuntimeError("Không có video hợp lệ")
 
     latest = max(valid, key=lambda e: e["timestamp"])
-    video_id = latest["id"]
-    title = latest.get("title", "")
+    return f"https://www.tiktok.com/@{username}/video/{latest['id']}", latest.get("title", "")
 
-    return f"https://www.tiktok.com/@{username}/video/{video_id}", title
+
 
 
 def download_audio(video_url: str, video_id: str):
     os.makedirs(AUDIO_DIR, exist_ok=True)
 
-    ydl_opts = {
-        "format": "bestaudio/best[acodec!=none]/best",
-        "outtmpl": os.path.join(AUDIO_DIR, f"{video_id}.%(ext)s"),
-        "cookies": COOKIES_FILE,
-        "nocheckcertificate": True,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
-        "quiet": False,
-        "no_warnings": True,
-        # "impersonate": "chrome",
-        "referer": "https://www.tiktok.com/",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "http_headers": {
-            "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept": "*/*",
-        },
-        "verbose": True,
-        "extractor_args": {"tiktok": {"api_hostname": "api16-normal-c-useast1a.tiktokv.com", "skip": "web"}},
-    }
+    if not COOKIES_FILES:
+        logging.warning("Không có cookies → thử download mà không cookies (có thể fail)")
+        cookies_list = [None]
+    else:
+        cookies_list = COOKIES_FILES.copy()
+        random.shuffle(cookies_list)
+        logging.info(f"Sử dụng {len(cookies_list)} bộ cookies (random order)")
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([video_url])
+    max_attempts = len(cookies_list) if cookies_list else 1
 
-    return os.path.join(AUDIO_DIR, f"{video_id}.mp3")
+    for attempt, cookies_file in enumerate(cookies_list, 1):
+        cookies_name = os.path.basename(cookies_file) if cookies_file else "Không cookies"
+        logging.info(f"Thử download attempt {attempt}/{max_attempts} với cookies: {cookies_name}")
 
+        ydl_opts = {
+            "format": "bestaudio/best[acodec!=none]/best",
+            "outtmpl": os.path.join(AUDIO_DIR, f"{video_id}.%(ext)s"),
+            "nocheckcertificate": True,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+            "quiet": False,
+            "no_warnings": True,
+            "referer": "https://www.tiktok.com/",
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "http_headers": {
+                "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept": "*/*",
+            },
+            "verbose": True,
+        }
+
+        if cookies_file:
+            ydl_opts["cookies"] = cookies_file
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url])
+            logging.info(f"✅ Download thành công với {cookies_name}")
+            return os.path.join(AUDIO_DIR, f"{video_id}.mp3")
+
+        except Exception as e:
+            error_str = str(e).lower()
+            logging.warning(f"Fail với {cookies_name}: {str(e)[:150]}")
+
+            retry_keywords = ["429", "too many requests", "rate limit", "sign in", "bot", "private", "login required", "cookies", "forbidden", "403"]
+            if any(kw in error_str for kw in retry_keywords) and attempt < max_attempts:
+                wait = random.randint(15, 45)
+                logging.info(f"→ Lỗi rate-limit/cookies → thử cookies tiếp theo sau {wait}s...")
+                time.sleep(wait)
+                continue
+            else:
+                raise RuntimeError(f"Download fail sau {attempt} attempts: {str(e)}")
+
+    raise RuntimeError(f"Tất cả {max_attempts} bộ cookies đều fail cho {video_url}")
 
 def main():
     conn = db.get_connection()
@@ -116,21 +261,28 @@ def main():
         groups = cur.fetchall()
     conn.close()
 
+    success_list = []
+    failed_list = []
+    skipped_list = []
+
+    if not COOKIES_FILES:
+        logging.warning("Không có cookies → crawl có thể fail nhiều do rate-limit!")
+
     for username, name in groups:
         username = username.replace("@", "")
         start = time.time()
 
-        print(f"\n🎵 Xử lý: {name}")
-        print(f"⏳ Đợi random 40-50s để tránh rate limit...")
-        time.sleep(random.randint(50, 60))
+        logging.info(f"\n🎵 Xử lý: {name}")
+        logging.info(f"⏳ Đợi random 40-50s để tránh rate limit...")
+        time.sleep(random.randint(40, 50))
 
         try:
             video_url, title = get_latest_video_url(username)
 
-            # Kiểm tra DB
             if not db.validate_yt_post(title, video_url):
-                print("⏭️ Đã tồn tại, bỏ qua")
-                time.sleep(random.randint(50, 60))
+                logging.info("⏭️ Đã tồn tại, bỏ qua")
+                skipped_list.append((username, name, "Đã tồn tại"))
+                time.sleep(random.randint(40, 50))
                 continue
 
             video_id_db = f"t_{username}_{int(time.time())}"
@@ -139,47 +291,66 @@ def main():
             db.insert_yt_post(video_id_db, title, video_url, audio_path)
 
             elapsed = time.time() - start
-            print(f"✅ Thành công: {audio_path} ({elapsed:.1f}s)")
-            print(f"⏳ Đợi random 40-50s trước khi tiếp tục...")
-            time.sleep(random.randint(50, 60))
+            logging.info(f"✅ Thành công: {audio_path} ({elapsed:.1f}s)")
+            success_list.append((username, name, title[:50]))
+            logging.info(f"⏳ Đợi random 40-50s trước khi tiếp tục...")
+            time.sleep(random.randint(40, 50))
 
         except Exception as e:
             elapsed = time.time() - start
-            print(f"❌ Lỗi chi tiết cho {username}: {repr(e)} - {str(e)} ({elapsed:.1f}s)")
-            traceback.print_exc()  # In stack trace đầy đủ
-            logging.error(f"Lỗi {username}: {repr(e)}\n{traceback.format_exc()}")
+            error_str = str(e)
+            logging.error(f"❌ Lỗi chi tiết cho {username}: {repr(e)} - {error_str} ({elapsed:.1f}s)")
+            traceback.print_exc(file=sys.stdout)
+            logging.error(traceback.format_exc())
 
-            if "429" in str(e):
-                wait = random.randint(300, 600)
-                print(f"⚠️ Rate limit, đợi {wait//60} phút")
+            if "Unable to extract secondary user ID" in error_str:
+                logging.warning(f"⚠️ Bỏ qua kênh {username}: Profile private hoặc bị block")
+                skipped_list.append((username, name, "Không lấy được secUid"))
+            elif "429" in error_str or "Too Many Requests" in error_str:
+                wait = random.randint(300, 900)
+                logging.warning(f"⚠️ Rate limit toàn cục, đợi {wait//60} phút...")
                 time.sleep(wait)
+            elif "fail sau" in error_str and "cookies" in error_str.lower():
+                failed_list.append((username, name, "Tất cả cookies fail (rate-limit/login?)"))
             else:
-                time.sleep(random.randint(50, 60))
+                failed_list.append((username, name, error_str[:80]))
 
+            time.sleep(random.randint(40, 80))
+
+    # Summary
+    logging.info("\n" + "="*60)
+    logging.info("📊 KẾT QUẢ CRAWL")
+    logging.info("="*60)
+    logging.info(f"\n✅ THÀNH CÔNG: {len(success_list)}")
+    for u, n, t in success_list:
+        logging.info(f"   - @{u} ({n}): {t}")
+    logging.info(f"\n⏭️ BỎ QUA: {len(skipped_list)}")
+    for u, n, reason in skipped_list:
+        logging.info(f"   - @{u} ({n}): {reason}")
+    logging.info(f"\n❌ THẤT BẠI: {len(failed_list)}")
+    for u, n, err in failed_list:
+        logging.info(f"   - @{u} ({n}): {err}")
+    logging.info("\n" + "="*60)
 
 def run_scheduler():
-    """Run with APScheduler based on config"""
     config = load_config()
     scheduler_cfg = config["scheduler"]
-
     if not scheduler_cfg.get("enabled", True):
-        print("Scheduler is disabled in config")
+        logging.info("Scheduler is disabled in config")
         return
 
     scheduler = BlockingScheduler(timezone=scheduler_cfg.get("timezone", "Asia/Ho_Chi_Minh"))
     schedule_type = scheduler_cfg.get("type", "interval")
     settings = scheduler_cfg.get("settings", {})
 
-    # Create trigger based on type
     if schedule_type == "interval":
         interval_cfg = settings.get("interval", {})
         trigger = IntervalTrigger(
             hours=interval_cfg.get("hours", 0),
             minutes=interval_cfg.get("minutes", 0),
-            seconds=interval_cfg.get("seconds", 0) or 3600  # default 1 hour
+            seconds=interval_cfg.get("seconds", 0) or 3600
         )
-        print(f"Scheduled: every {interval_cfg.get('hours', 0)}h {interval_cfg.get('minutes', 0)}m")
-
+        logging.info(f"Scheduled: every {interval_cfg.get('hours', 0)}h {interval_cfg.get('minutes', 0)}m")
     elif schedule_type == "cron":
         cron_cfg = settings.get("cron", {})
         trigger = CronTrigger(
@@ -187,33 +358,29 @@ def run_scheduler():
             minute=cron_cfg.get("minute", "0"),
             day_of_week=cron_cfg.get("day_of_week", "*")
         )
-        print(f"Scheduled: cron hour={cron_cfg.get('hour')}, minute={cron_cfg.get('minute')}")
-
+        logging.info(f"Scheduled: cron hour={cron_cfg.get('hour')}, minute={cron_cfg.get('minute')}")
     elif schedule_type == "date":
         date_cfg = settings.get("date", {})
         trigger = DateTrigger(run_date=date_cfg.get("run_date"))
-        print(f"Scheduled: one-time at {date_cfg.get('run_date')}")
-
+        logging.info(f"Scheduled: one-time at {date_cfg.get('run_date')}")
     else:
-        print(f"Unknown schedule type: {schedule_type}")
+        logging.error(f"Unknown schedule type: {schedule_type}")
         return
 
     scheduler.add_job(main, trigger, id="tiktok_downloader", replace_existing=True)
 
-    # Run immediately on startup if configured
     if scheduler_cfg.get("run_on_startup", False):
-        print("Running immediately on startup...")
+        logging.info("Running immediately on startup...")
         main()
 
-    print("Scheduler started. Press Ctrl+C to exit.")
+    logging.info("Scheduler started. Press Ctrl+C to exit.")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
-        print("Scheduler stopped.")
-
+        logging.info("Scheduler stopped.")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--once":
-        main()  # Run once without scheduler
+        main()
     else:
         run_scheduler()
