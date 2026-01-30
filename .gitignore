@@ -1,3 +1,6 @@
 cookies_loi.txt
 *.cookies
 cookies*.txt
+cookies/
+browser_state/
+__pycache__/
