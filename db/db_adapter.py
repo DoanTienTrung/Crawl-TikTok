@@ -1,23 +1,24 @@
-import psycopg2
 import os
+import psycopg2
 
 DB_CONFIG = {
-    "host": "localhost",
-    "dbname": "tiktok_crawler",
-    "user": "postgres",
-    "password": "admin123@", 
-    "port": 5432
+    "host": os.getenv("DB_HOST", "localhost"),
+    "dbname": os.getenv("DB_NAME", "tiktok_crawler"),
+    "user": os.getenv("DB_USER", "postgres"),
+    "password": os.getenv("DB_PASSWORD", "your_password_here"),
+    "port": int(os.getenv("DB_PORT", 5432))
 }
+
 
 def get_connection():
     try:
         return psycopg2.connect(**DB_CONFIG)
     except Exception as e:
-        print("❌ DB connection error:", e)
+        print(f"DB connection error: {e}")
         return None
 
 
-def validate_yt_post(title, url) -> bool:
+def validate_yt_post(title: str, url: str) -> bool:
     conn = get_connection()
     if not conn:
         return False
@@ -30,7 +31,7 @@ def validate_yt_post(title, url) -> bool:
         conn.close()
 
 
-def insert_yt_post(video_id, title, url, audio_path):
+def insert_yt_post(video_id: str, title: str, url: str, audio_path: str) -> bool:
     conn = get_connection()
     if not conn:
         return False

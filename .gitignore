@@ -1,6 +1,24 @@
-cookies_loi.txt
-*.cookies
-cookies*.txt
+# Cookies & Session
 cookies/
 browser_state/
+*.cookies
+cookies*.txt
+
+# Python
 __pycache__/
+*.pyc
+venv/
+.venv/
+
+# Logs
+*.log
+
+# Downloads
+downloads/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env

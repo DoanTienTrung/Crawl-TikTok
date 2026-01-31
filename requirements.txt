@@ -1,5 +1,4 @@
 yt-dlp>=2024.12.13
-curl_cffi
-ffmpeg-python
 psycopg2-binary
-requests                 
+apscheduler
+playwright
